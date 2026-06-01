@@ -2,14 +2,14 @@
 # One-time bootstrap: clone + symlink + schedule auto-pull
 set -euo pipefail
 
-REPO_DIR="$HOME/.treasure-work/td-work-skills"
+REPO_DIR="$HOME/.treasure-work/ai-ops-engagement-report-skill"
 SKILLS_DIR="$HOME/.treasure-work/.claude/skills"
-PLIST="$HOME/Library/LaunchAgents/ai.treasure.td-work-skills-update.plist"
+PLIST="$HOME/Library/LaunchAgents/ai.treasure.ai-ops-engagement-report-skill-update.plist"
 REPO_URL="${1:-}"
 
 if [[ -z "$REPO_URL" ]]; then
   echo "Usage: install.sh <git-repo-url>"
-  echo "Example: install.sh https://github.com/your-org/td-work-skills.git"
+  echo "Example: install.sh https://github.com/your-org/ai-ops-engagement-report-skill.git"
   exit 1
 fi
 
@@ -47,7 +47,7 @@ cat > "$PLIST" <<PLIST
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>ai.treasure.td-work-skills-update</string>
+  <string>ai.treasure.ai-ops-engagement-report-skill-update</string>
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
@@ -58,9 +58,9 @@ cat > "$PLIST" <<PLIST
   <key>RunAtLoad</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>${HOME}/.treasure-work/logs/td-work-skills-update.log</string>
+  <string>${HOME}/.treasure-work/logs/ai-ops-engagement-report-skill-update.log</string>
   <key>StandardErrorPath</key>
-  <string>${HOME}/.treasure-work/logs/td-work-skills-update.log</string>
+  <string>${HOME}/.treasure-work/logs/ai-ops-engagement-report-skill-update.log</string>
 </dict>
 </plist>
 PLIST

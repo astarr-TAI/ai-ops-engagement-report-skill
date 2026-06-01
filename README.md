@@ -1,15 +1,15 @@
-# td-work-skills
+# ai-ops-engagement-report-skill
 
 Shared Treasure Work skills for the CS team. Skills update automatically — no action required after initial setup.
 
 ## Setup (one time per machine)
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/astarr-TAI/td-work-skills/main/install.sh) https://github.com/astarr-TAI/td-work-skills.git
+bash <(curl -fsSL https://raw.githubusercontent.com/astarr-TAI/ai-ops-engagement-report-skill/main/install.sh) https://github.com/astarr-TAI/ai-ops-engagement-report-skill.git
 ```
 
 This will:
-1. Clone the repo to `~/.treasure-work/td-work-skills`
+1. Clone the repo to `~/.treasure-work/ai-ops-engagement-report-skill`
 2. Symlink each skill into `~/.treasure-work/.claude/skills/`
 3. Install a launchd job that pulls updates every hour
 
@@ -33,9 +33,9 @@ Edit the files in `cs-engagement-report/` and push to main. All users pick up th
 
 > Note: existing users only get new skill symlinks if they re-run `install.sh` or manually symlink. The `update.sh` / launchd job only pulls — it does not create new symlinks. For new skills, send the one-liner below to the team:
 > ```bash
-> ln -s ~/.treasure-work/td-work-skills/new-skill-name ~/.treasure-work/.claude/skills/new-skill-name
+> ln -s ~/.treasure-work/ai-ops-engagement-report-skill/new-skill-name ~/.treasure-work/.claude/skills/new-skill-name
 > ```
 
 ## Logs
 
-Auto-pull logs: `~/.treasure-work/logs/td-work-skills-update.log`
+Auto-pull logs: `~/.treasure-work/logs/ai-ops-engagement-report-skill-update.log`

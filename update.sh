@@ -2,7 +2,7 @@
 # Pull latest skill updates. Called hourly by launchd; safe to run manually.
 set -euo pipefail
 
-REPO_DIR="$HOME/.treasure-work/td-work-skills"
+REPO_DIR="$HOME/.treasure-work/ai-ops-engagement-report-skill"
 
 if [[ ! -d "$REPO_DIR/.git" ]]; then
   echo "ERROR: Repo not found at $REPO_DIR. Run install.sh first."
