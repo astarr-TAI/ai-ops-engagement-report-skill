@@ -18,6 +18,7 @@ This will:
 | Skill | Description |
 |-------|-------------|
 | `cs-engagement-report` | CS engagement health report — scores accounts Green/Yellow/Red against tier-based meeting mandates. Trigger: "Americas team rollup", "EMEA engagement", "{name}'s book of business" |
+| `auto-pull-zoom-transcript` | Pull a transcript from a Zoom meeting doc URL. Trigger: any `docs.zoom.us/doc/` URL, "pull zoom transcript", "get zoom transcript" |
 
 ## Updating a skill
 

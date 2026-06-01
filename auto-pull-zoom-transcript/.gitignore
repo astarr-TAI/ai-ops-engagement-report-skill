@@ -1,0 +1,6 @@
+# Vendored Python deps — machine-specific binaries, not committed.
+# Each user installs locally: pip install curl-cffi --target vendor/
+vendor/
+.local/
+*.bak
+*.bak2

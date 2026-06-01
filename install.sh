@@ -74,3 +74,17 @@ for skill_dir in "$REPO_DIR"/*/; do
   skill_name="$(basename "$skill_dir")"
   [[ -f "$skill_dir/SKILL.md" ]] && echo "  • $skill_name"
 done
+
+# Post-link setup: install vendored deps for skills that need them
+echo ""
+echo "Installing vendored dependencies..."
+ZOOM_SKILL="$SKILLS_DIR/auto-pull-zoom-transcript"
+if [[ -L "$ZOOM_SKILL" || -d "$ZOOM_SKILL" ]]; then
+  vendor_dir="$REPO_DIR/auto-pull-zoom-transcript/vendor"
+  if [[ ! -d "$vendor_dir" ]]; then
+    echo "  Installing curl-cffi for auto-pull-zoom-transcript..."
+    pip3 install curl-cffi --target "$vendor_dir" -q && echo "  Done." || echo "  WARNING: pip3 install failed — install curl-cffi manually into $vendor_dir"
+  else
+    echo "  auto-pull-zoom-transcript vendor deps already present."
+  fi
+fi
