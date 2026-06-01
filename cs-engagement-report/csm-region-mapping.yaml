@@ -1,0 +1,229 @@
+# How to map CSMs to regions
+# Process for deriving a CSM -> region mapping from HubSpot.
+# Excludes deactivated/active checks.
+
+inputs:
+  primary:
+    name: HubSpot company-region
+    type: hubspot_property
+    rationale: |
+      Region is recorded on each account via td_company_owner_region; CSM
+      assignment via csm_email + csm__c. Aggregating by csm_email yields the
+      per-CSM region with majority vote. HubSpot is the system of record for
+      both fields, so deriving the matrix from it directly avoids transcription
+      lag and removes the dependency on a separate roster sheet.
+    access_via: hubspot_search_crm_objects
+    object_type: companies
+    filter:
+      - csm_email HAS_PROPERTY
+      - td_company_owner_region HAS_PROPERTY
+    properties_used:
+      - hs_object_id              # company id (join key for downstream queries)
+      - name                      # account display name
+      - csm_email                 # CSM email - primary identity key
+      - td_company_owner_region   # region tag (Americas / EMEA / Japan / ASIAexJapan / APAC)
+      - arr_won_all_rollup        # ARR rollup (used for tier classification + ranking)
+    sharding: |
+      The HubSpot search endpoint caps each response at 100 records and does not
+      expose a cursor in the current MCP tool. Shard the query by hs_object_id
+      ranges and fan out in parallel; each shard must be sized to stay under
+      the 100-record cap. As of 2026-05-19 the company table has ~456 rows;
+      8 shards covers it cleanly:
+        - id < 150085000000
+        - 150085000000 <= id < 150092000000
+        - 150092000000 <= id < 150100000000
+        - 150100000000 <= id < 150160000000
+        - 150160000000 <= id < 150175000000
+        - 150175000000 <= id < 150180000000
+        - 150180000000 <= id < 300000000000
+        - id >= 300000000000
+      If any shard returns count == 100 in a future run, subdivide that shard.
+      Always sort ASC on hs_object_id within each shard for deterministic output.
+
+  excluded:
+    - name: Greenspace HeatMap
+      reason: |
+        Previously the primary source. Now redundant because every Greenspace
+        column derives from HubSpot custom company properties + deal associations
+        + owner team metadata. HubSpot is the system of record; Greenspace is a
+        sheet view that lags. Reintroduce only if RevOps maintains overrides in
+        Greenspace that aren't pushed back to HubSpot.
+    - name: Gainsight
+      reason: Neither gsuser nor Company has a region field.
+    - name: Glean people search
+      reason: Returns documents associated with a person, not a directory record. No structured region attribute.
+    - name: HubSpot owner endpoint
+      reason: hubspot_search_owners blocked by current MCP auth scope. Used for proper-name resolution if/when unblocked.
+
+steps:
+  - id: 1_pull_hubspot
+    description: Fan out 8 parallel hubspot_search_crm_objects calls on companies, sharded by hs_object_id range.
+    output: list of {hs_object_id, name, csm_email, region, arr} tuples
+    notes: |
+      Dedupe by hs_object_id when concatenating shard results (boundary records
+      shouldn't appear in two shards if ranges are half-open, but defensive
+      dedup is cheap). Filter region to valid_regions to drop any malformed
+      values. Treat csm_email values like "Hiroki Ito" or "jamie@origin63.com"
+      as data errors and exclude - they aren't internal CSM identities.
+
+  - id: 2_normalize_identity
+    description: Normalize csm_email to its local part (lowercased) so @treasure.ai and @treasure-data.com aliases collapse to one identity.
+    method: |
+      key = email.split("@")[0].lower()
+    notes: |
+      Same CSM frequently appears under both domains (e.g. naohiro.nakatani@treasure-data.com
+      and naohiro.nakatani@treasure.ai). Aggregating without dedup splits their
+      book in half.
+
+  - id: 3_aggregate_per_csm
+    description: |
+      For each csm_local, count region occurrences across their VALID-region accounts and
+      pick the majority. The resulting csm_region is the SOLE field that determines which
+      regional roundup the CSM appears in. Per-account region tags do not split a CSM's
+      book across roundups - the CSM travels in their majority region with their entire
+      book in tow.
+    method: |
+      For csm_local in groups:
+        # 1. Drop accounts whose region is null or not in valid_regions
+        valid_accounts = [a for a in csm_accounts if a.region in VALID_REGIONS]
+
+        # 2. Majority vote, with deterministic tie-break
+        regions = Counter(a.region for a in valid_accounts)
+        max_count = max(regions.values())
+        top_candidates = sorted(
+          [r for r, c in regions.items() if c == max_count],
+          key=lambda r: TIE_BREAK_ORDER.index(r),  # see tie_break below
+        )
+        top_region = top_candidates[0]
+        tied_majority = top_candidates if len(top_candidates) > 1 else None
+
+        # 3. cross_region flag (presentation only - does NOT split the book)
+        cross_region = (
+          len(regions) > 1
+          and (sum_minority := sum(c for r, c in regions.items() if r != top_region)) >= 2
+          and sum_minority / sum(regions.values()) >= 0.20
+        )
+    tie_break: |
+      Deterministic tie-break order when two or more regions have the same count:
+        Americas > EMEA > Japan > ASIAexJapan > APAC
+      Record the tie in the matrix row as `tied_majority: [Americas, EMEA]` so a
+      downstream reviewer can spot edge cases without re-deriving them.
+    assignment_policy: |
+      HARD RULE - csm_region is the ONLY input to roundup membership.
+      An account whose td_company_owner_region == "Americas" but whose owning
+      CSM resolves to csm_region == "EMEA" appears in the EMEA roundup, not
+      the Americas roundup. There is no per-account region override, no
+      "Americas-tagged accounts split off" rule, no joint inclusion. The
+      account is reported under its CSM's region; the per-account tag is
+      shown in the rendered scorecard cell as informational metadata only.
+
+      Anti-pattern (do NOT do this):
+        scorecard = [a for a in per_account_table if a.region == target]
+      Correct pattern:
+        in_scope_csms = {csm for csm, region in csm_region.items() if region == target}
+        scorecard = [a for a in per_account_table if a.csm_email_local in in_scope_csms]
+    notes: |
+      The cross_region flag (>=20% minority AND >=2 minority accounts) catches
+      genuine cross-region books like Ana María Villota Serrano (Americas + Brazilian/
+      Mexican Nestlé entities tagged EMEA), Carol Nicholson-Cole (UK + US Mars/Levi),
+      Gaëlle Chedid (mostly EMEA media + 1 Kuwait Food Americana account tagged Americas),
+      and Naohiro Yoshikawa (Japan + Korean accounts in ASIAexJapan). The flag is for
+      surfacing the breakdown in the rendered report, not for assigning accounts to
+      a different region. Don't reassign their region - flag and surface.
+
+  - id: 4_assign_confidence
+    description: Confidence is a function of book size, since there's no second source to cross-check against.
+    rules:
+      - if n_accounts >= 5: high
+      - if n_accounts >= 2: medium
+      - if n_accounts == 1: low (single-account assignments are often placeholders, SDRs, or brand-new CSMs)
+
+  - id: 5_resolve_display_name
+    description: |
+      HubSpot's company record has csm_email but no canonical display name.
+      Apply the override map below first, then fall back to period-delimiter capitalization.
+    overrides:
+      ana.villotaserrano: "Ana María Villota Serrano"
+      valencia: "Sean Valencia"
+      meg.roy: "Megan Roy"
+      ino: "Tsuyuki Ino"
+      tsukahara: "Kazuki Tsukahara"
+      sekikawa: "Makoto Sekikawa"
+      naohiro.nakatani: "Nao Nakatani"
+    fallback: |
+      Split local part on '.' and '-', capitalize each token, join with spaces.
+      Example: meg.roy -> "Meg Roy"; carol.nicholson-cole -> "Carol Nicholson Cole"
+      (loses the hyphen - that's the limit of the fallback rule). When
+      hubspot_search_owners is unblocked, prefer that over the fallback.
+
+  - id: 6_emit_matrix
+    description: |
+      Output one row per CSM PLUS a per-account roll-up. The per-account table
+      carries each account's own region tag (informational), but consumers MUST
+      filter by csm_email_local against the in-scope CSM set, never by the
+      per-account region tag (see step 3 assignment_policy).
+    fields:
+      - name              # display name (override or fallback)
+      - email             # canonical @treasure.ai
+      - region            # majority region from HubSpot
+      - confidence        # high/medium/low based on n_accounts
+      - n_accounts        # book size
+      - arr_total         # sum of arr_won_all_rollup across their accounts
+      - region_breakdown  # full Counter, e.g. {Americas: 12, EMEA: 4}
+      - cross_region      # bool, true if >=20% minority + >=2 accounts
+    accounts_table: |
+      Also emit per-account rows: {hs_object_id, name, csm_email_local, region, arr}.
+      The cs-engagement-report skill consumes this directly as the book-of-business
+      filter - no separate query needed for "what accounts does CSM X own?".
+
+      Consumption rule (HARD):
+        in_scope_csms = {csm for csm, info in csm_matrix.items()
+                         if info.csm_region == target_region}
+        scorecard_rows = [r for r in per_account_table
+                          if r.csm_email_local in in_scope_csms]
+      The per-account `region` field is NEVER used as a roundup filter. It is
+      surfaced in the rendered scorecard for transparency (so a reviewer can see
+      "this US-tagged account is in the EMEA roundup because Carol owns it"),
+      but it does not gate inclusion.
+
+      Do NOT pre-filter by ARR here - emit every account (including zero-ARR rows).
+      The cs-engagement-report skill applies its own configurable min_arr threshold
+      at Step 1.6 and surfaces filtered accounts in the dashboard's excludedAccounts
+      footer. Filtering at this level would silently hide accounts from any
+      consumer that isn't using the engagement report's filter.
+
+valid_regions:
+  - Americas
+  - EMEA
+  - Japan
+  - ASIAexJapan
+  - APAC
+
+known_pitfalls:
+  - The same CSM appears under both @treasure-data.com and @treasure.ai email
+    domains. Always dedupe on the local part before aggregating, otherwise
+    their book splits and confidence drops artificially.
+  - Cross-region books (Nestlé spread across Americas/EMEA, Mars across UK/US,
+    Korean accounts under a Japan-tagged CSM, Gaëlle Chedid's lone Kuwait Food
+    Americana account inside an otherwise EMEA book) are real and structural.
+    Don't "fix" them by reassigning the CSM's primary region - flag with
+    cross_region: true and let the rendered report show the breakdown.
+    AND: never split a cross-region CSM across two roundups. The CSM lives in
+    exactly one regional roundup (their majority csm_region) and their full
+    book travels with them. The audit signature of getting this wrong: a
+    CSM's account appears in region X's report but the CSM is missing from
+    that region's CSM list - that means the scoping was account-first instead
+    of CSM-first. See step 3 assignment_policy.
+  - csm_email occasionally contains a person's name string ("Hiroki Ito") or an
+    external partner address ("jamie@origin63.com"). These are HubSpot data
+    errors. Filter them out by checking that the local part has a "." separator
+    (or matches a known single-token override like "valencia" / "ino" /
+    "tsukahara" / "sekikawa") and the domain is treasure.ai / treasure-data.com.
+  - Deactivated CSMs cannot be detected from HubSpot company data alone. If a
+    CSM has departed but their account assignments haven't been transferred,
+    they'll appear in the matrix indistinguishable from active CSMs. Surface
+    via a separate signal (HubSpot owner last-login if accessible, or a
+    workspace-maintained deactivated_csms.yaml).
+  - arr_won_all_rollup occasionally contains negative or zero values (cancelled
+    deals, unreconciled credits). Floor to 0 when summing for tier
+    classification.
