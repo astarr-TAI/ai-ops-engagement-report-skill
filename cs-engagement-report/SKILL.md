@@ -190,7 +190,15 @@ Start from the **calendar invitee list**. For each external attendee, look up th
 **Attribution algorithm (in order):**
 1. Build the external-attendee email list per event: drop internal TD attendees (`treasure.ai`, `treasure-data.com`, `treasuredata.com`) and system-domain entries (`*.calendar.google.com`).
 2. Drop attendees whose domain is in the partner list above. They're noise, not clients.
-3. **For each remaining email, look up a HubSpot contact** via `hubspot_search_crm_objects` on `contacts` with `email EQ <attendee_email>`, requesting properties `email`, `associatedcompanyid`, `firstname`, `lastname`, `company`. Cache by email — the same attendee will recur across many events, so query each unique address once per run.
+3. **Batch-resolve all external attendee emails against HubSpot contacts in one pass.** After collecting all events across all in-scope CSMs, extract the full set of unique external attendee emails (minus internal and partner domains). Partition into chunks of up to 100 emails and fan out one `hubspot_search_crm_objects` call per chunk on `contacts` with an `IN` filter on the `email` property, requesting properties `email`, `hs_additional_emails`, `associatedcompanyid`, `firstname`, `lastname`, `company`. Merge results into a single `hubspot_contacts` dict keyed by lowercased email — this is the shared cache for all attribution. The cache is built **once before any attribution runs**, not lazily per-event. This reduces hundreds of sequential per-email lookups to a handful of parallel batch calls (e.g. 400 unique emails → 4 calls instead of 400).
+
+   **Batch call pattern:**
+   - Collect all unique external emails across every CSM's full event set before making any HubSpot contact calls.
+   - Fan the batch calls out in parallel (one per chunk of ≤100 emails).
+   - Merge all chunk responses into one `hubspot_contacts` dict before proceeding to attribution.
+   - The `IN` filter syntax: `{filters: [{propertyName: email, operator: IN, values: [a@b.com, c@d.com, ...]}]}`.
+   - A contact whose primary `email` does not appear in the batch response but whose `hs_additional_emails` does is a known gap with batch queries — for any email that returns no contact record, issue a single follow-up `EQ` lookup. In practice this is rare; log it to the `domains_with_no_contact_match` audit list if it recurs.
+
 4. From each matched contact, take `associatedcompanyid` (or, if multiple associations exist, the primary company association). Look up that `hs_object_id` in the CSM's book of business set.
 5. If the company is in the CSM's book → attribute the meeting to that company.
 6. If attendees on a single event resolve to **multiple distinct companies** in the book → log the meeting once per company (e.g. a joint Nestlé Brasil + Marcas Nestlé México sync counts for both records).
@@ -200,7 +208,7 @@ Start from the **calendar invitee list**. For each external attendee, look up th
 Falling back to "domain matches a HubSpot company's `domain` field" is allowed only when **every** external attendee on the event has no HubSpot contact record at all. In that case attribute by domain *only if the domain is unambiguous in the CSM's book* — i.e. exactly one company in their book has that domain. If the domain maps to multiple companies in the book (Nestlé case, Honda case), drop the meeting and flag the attendee email for sales-ops to add as a HubSpot contact. This fallback exists because brand-new prospects sometimes haven't been logged as contacts yet; it must never be the default path.
 
 **Caching:**
-- Cache contact lookups by email — one query per unique attendee. Persist the cache across CSMs in a single run; many emails recur (TD field engineers, partner agencies, etc.).
+- The `hubspot_contacts` dict built in step 3 serves as the shared cache for the entire run. All attribution reads from this dict — no further HubSpot contact calls are made during event processing.
 - Cache the per-CSM book-of-business `hs_object_id` set in memory; the contact's `associatedcompanyid` only counts if it's in that set.
 - Keep a `domains_with_no_contact_match` audit list — emit it at the end of the run as a sales-ops follow-up so HubSpot coverage improves over time.
 
