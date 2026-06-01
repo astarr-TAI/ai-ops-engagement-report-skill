@@ -5,7 +5,7 @@ Shared Treasure Work skills for the CS team. Skills update automatically — no 
 ## Setup (one time per machine)
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_ORG/td-work-skills/main/install.sh) https://github.com/YOUR_ORG/td-work-skills.git
+bash <(curl -fsSL https://raw.githubusercontent.com/astarr-TAI/td-work-skills/main/install.sh) https://github.com/astarr-TAI/td-work-skills.git
 ```
 
 This will:
