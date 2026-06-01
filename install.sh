@@ -54,7 +54,7 @@ cat > "$PLIST" <<PLIST
     <string>${REPO_DIR}/update.sh</string>
   </array>
   <key>StartInterval</key>
-  <integer>3600</integer>
+  <integer>18000</integer>
   <key>RunAtLoad</key>
   <true/>
   <key>StandardOutPath</key>
