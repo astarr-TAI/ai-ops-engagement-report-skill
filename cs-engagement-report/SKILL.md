@@ -41,16 +41,16 @@ This skill produces a customer engagement health report that:
 
 - **Google Calendar** — CSM's meetings (accepted or organized) over L60D minimum
 - **HubSpot Contacts** — Resolve each external attendee email → contact → `associatedcompanyid`. This is the primary attribution path.
-- **HubSpot Companies** — Get company name, owner (CSM assignment via `hubspot_owner_id` / `ownername`), domain, **region** (via `td_company_owner_region`), and **CSM identity** (via `csm_email` + `csm__c`). Also the source of the CSM→region matrix.
-- **HubSpot Deals** — Get ARR from closed-won deals (`dealstage` containing "6.0 Closed Won", `amount` field) associated with companies. Note: for tier classification you can use `companies.arr_won_all_rollup` directly instead of summing deals.
+- **hubspot.companies (TD account 7060)** — The canonical source for the CSM→region matrix. Query via `tdx query` against the `hubspot.companies` table. Fields used: `csm_email`, `td_company_owner_region`, `name`, `arr_won_all_rollup`. Returns all records in one call — no MCP sharding required. See `csm-region-mapping.yaml` for the exact SQL.
+- **hubspot.deals + hubspot.deals_to_companies_associations (TD account 7060)** — For deal-level ARR detail, query TD directly. For standard tier classification, use `arr_won_all_rollup` from `hubspot.companies` (already in the Step 1 matrix) — do **not** use `arr_won__all_` which is always zero.
 
 ## CSM Discovery
 
-CSM→region mapping is **derived at runtime from HubSpot alone** by following the procedure in **`csm-region-mapping.yaml`** — a sibling file inside this skill folder (bundled with the skill, not workspace-relative). The file is a *playbook*, not a static lookup table — it specifies the query, sharding strategy, identity normalization, and aggregation rules. Read it first, then execute the steps it documents.
+CSM→region mapping is **derived at runtime from the TD `hubspot.companies` table** by following the procedure in **`csm-region-mapping.yaml`** — a sibling file inside this skill folder (bundled with the skill, not workspace-relative). The file is a *playbook*, not a static lookup table — it contains the exact SQL query, identity normalization rules, aggregation logic, and known pitfalls. Read it first, then execute the steps it documents.
 
 **What the playbook specifies:**
-- **Single source — HubSpot company-region.** Use `hubspot_search_crm_objects` on `companies` with `csm_email` and `td_company_owner_region` populated. Both fields live on the same company record, so one paginated query covers everything.
-- **Sharding** (`inputs.primary.sharding`): the MCP tool caps each response at 100 records and exposes no cursor. Fan out 8 parallel calls sharded by `hs_object_id` ranges (the playbook lists the exact boundaries that keep each shard under 100 as of 2026-05-19). If any shard returns `count == 100` in a future run, subdivide it.
+- **Single source — TD `hubspot.companies` (account 7060).** Run one `tdx query` with the SQL in `inputs.primary.query`. The table is a full sync of HubSpot company records; `csm_email` and `td_company_owner_region` are on every row. No MCP tool, no sharding, no cursor pagination — one call returns everything.
+- **Query** (`inputs.primary.query`): the SQL handles identity normalization (SPLIT_PART on `@`), valid-region filtering, bogus-email exclusion, majority-vote via ROW_NUMBER(), and deterministic tie-break in a single pass. Output is one row per account with `csm_local`, `csm_region`, `account_region`, `company`, `arr` ready to consume.
 - **Identity normalization** (`steps[2]`): dedupe `csm_email` on the local part, lowercased. The same CSM appears under both `@treasure.ai` and `@treasure-data.com`; failing to dedupe splits their book in half.
 - **Region aggregation** (`steps[3]`): for each `csm_local`, count valid regions across their accounts and take the majority — that majority is the CSM's `csm_region`, full stop. **`csm_region` is the only field that decides which regional roundup a CSM appears in.** A CSM whose majority is EMEA reports in EMEA even if half their accounts are tagged Americas; their Americas-tagged accounts come along for the ride, they do not split off into the Americas roundup. Set `cross_region: true` when **the minority of *valid* regions** is ≥20% AND ≥2 accounts (catches books like Ana María Villota Serrano's Americas+EMEA Nestlé split, Carol Nicholson-Cole's UK+US Mars/Levi, Naohiro Yoshikawa's Japan+Korea); the flag is for surfacing the breakdown in the rendered report, NOT for assigning an account to a different region. Null/garbage region values are missing-data noise — they are excluded from both the numerator and denominator of the minority calculation, so a CSM with 3 Americas + 2 unknown-region accounts is single-region, not cross-region. **Tie-break (deterministic):** when two regions tie for first place, pick in this order: `Americas` > `EMEA` > `Japan` > `ASIAexJapan` > `APAC`. Document the tie in the matrix as `tied_majority: [Americas, EMEA]`.
 - **Confidence** (`steps[4]`): based on book size alone — `high` if `n_accounts ≥ 5`, `medium` if 2-4, `low` if 1.
@@ -108,10 +108,10 @@ When in doubt about the user's intent, default to `min_arr = 1` and rely on the 
 
 ### Step 1: Identify the CSM(s)
 
-1. **Read the playbook.** Open `csm-region-mapping.yaml` to refresh on the sharding strategy, identity overrides, aggregation rules, and known pitfalls.
+1. **Read the playbook.** Open `csm-region-mapping.yaml` to refresh on the TD query, identity overrides, aggregation rules, and known pitfalls.
 2. **Execute the playbook to produce the CSM matrix:**
-   - Fan out 8 parallel `hubspot_search_crm_objects` calls on `companies`, sharded by `hs_object_id` range per `inputs.primary.sharding`. Request `hs_object_id`, `name`, `csm_email`, `td_company_owner_region`, `arr_won_all_rollup`, and `domain`. Filter to records with both `csm_email` and `td_company_owner_region` populated.
-   - Concatenate shard results, dedupe by `hs_object_id`, drop bogus `csm_email` values (no `.` and not in the single-token allowlist, or non-TD domain).
+   - Run the single `tdx query` from `inputs.primary.query` in `csm-region-mapping.yaml` against `hubspot.companies` (TD account 7060). The query returns one row per account with `csm_local`, `csm_region`, `account_region`, `company`, and `arr` already computed.
+   - Drop any rows where `csm_email` is a name string or non-TD domain — the WHERE clause in the query handles this, but verify if unexpected entries appear.
    - Group by `csm_email` local part (lowercased). For each CSM compute: majority region, `n_accounts`, `arr_total` (floor negatives to 0), `region_breakdown`, and `cross_region` flag.
    - Apply confidence rules (`high` if `n_accounts >= 5`, `medium` if 2-4, `low` if 1).
    - Resolve display names via the override map first, then the period-delimiter fallback.
@@ -190,14 +190,27 @@ Start from the **calendar invitee list**. For each external attendee, look up th
 **Attribution algorithm (in order):**
 1. Build the external-attendee email list per event: drop internal TD attendees (`treasure.ai`, `treasure-data.com`, `treasuredata.com`) and system-domain entries (`*.calendar.google.com`).
 2. Drop attendees whose domain is in the partner list above. They're noise, not clients.
-3. **Batch-resolve all external attendee emails against HubSpot contacts in one pass.** After collecting all events across all in-scope CSMs, extract the full set of unique external attendee emails (minus internal and partner domains). Partition into chunks of up to 100 emails and fan out one `hubspot_search_crm_objects` call per chunk on `contacts` with an `IN` filter on the `email` property, requesting properties `email`, `hs_additional_emails`, `associatedcompanyid`, `firstname`, `lastname`, `company`. Merge results into a single `hubspot_contacts` dict keyed by lowercased email — this is the shared cache for all attribution. The cache is built **once before any attribution runs**, not lazily per-event. This reduces hundreds of sequential per-email lookups to a handful of parallel batch calls (e.g. 400 unique emails → 4 calls instead of 400).
+3. **Batch-resolve all external attendee emails against contacts — TD table first, HubSpot MCP as fallback.**
 
-   **Batch call pattern:**
-   - Collect all unique external emails across every CSM's full event set before making any HubSpot contact calls.
-   - Fan the batch calls out in parallel (one per chunk of ≤100 emails).
-   - Merge all chunk responses into one `hubspot_contacts` dict before proceeding to attribution.
-   - The `IN` filter syntax: `{filters: [{propertyName: email, operator: IN, values: [a@b.com, c@d.com, ...]}]}`.
-   - A contact whose primary `email` does not appear in the batch response but whose `hs_additional_emails` does is a known gap with batch queries — for any email that returns no contact record, issue a single follow-up `EQ` lookup. In practice this is rare; log it to the `domains_with_no_contact_match` audit list if it recurs.
+   **Primary path — `hubspot.contacts` table (TD account 7060):**
+   After collecting all events across all in-scope CSMs, extract the full set of unique external attendee emails (minus internal and partner domains). Run a single `tdx query` against `hubspot.contacts` joined to `hubspot.companies_to_contacts_associations`:
+
+   ```sql
+   SELECT c.email, c.hs_additional_emails, a.company_id AS associatedcompanyid,
+          c.firstname, c.lastname
+   FROM hubspot.contacts c
+   LEFT JOIN hubspot.companies_to_contacts_associations a ON a.contact_id = c.id
+   WHERE LOWER(c.email) IN (<comma-separated lowercased email list>)
+   ```
+
+   Merge results into a single `hubspot_contacts` dict keyed by lowercased email. Build this cache **once before any attribution runs**. This replaces all MCP contact calls for emails that have a matching TD record.
+
+   **Fallback path — HubSpot MCP (`hubspot_search_crm_objects`):**
+   After the TD query, collect the set of emails with **no match** in the TD result. For these, fan out `hubspot_search_crm_objects` calls on `contacts` in parallel chunks of ≤100 with an `IN` filter on `email`, requesting `email`, `hs_additional_emails`, `associatedcompanyid`, `firstname`, `lastname`, `company`. Merge results into the same `hubspot_contacts` dict. This covers contacts that exist in HubSpot but haven't yet synced to TD, or whose email format differs.
+
+   - The TD query handles the majority (typically 90%+) of emails in a single call.
+   - The MCP fallback fires only for the remainder — usually a small tail.
+   - A contact whose primary `email` does not appear in either path but whose `hs_additional_emails` does is a known gap — log to the `domains_with_no_contact_match` audit list if it recurs.
 
 4. From each matched contact, take `associatedcompanyid` (or, if multiple associations exist, the primary company association). Look up that `hs_object_id` in the CSM's book of business set.
 5. If the company is in the CSM's book → attribute the meeting to that company.
@@ -212,15 +225,29 @@ Falling back to "domain matches a HubSpot company's `domain` field" is allowed o
 - Cache the per-CSM book-of-business `hs_object_id` set in memory; the contact's `associatedcompanyid` only counts if it's in that set.
 - Keep a `domains_with_no_contact_match` audit list — emit it at the end of the run as a sales-ops follow-up so HubSpot coverage improves over time.
 
-### Step 5: Get Account Metadata from HubSpot
+### Step 5: Get Account Metadata from TD
 
-For each identified client company:
-1. Search HubSpot companies by name (full-text query)
-2. Pull: `name`, `domain`, `hubspot_owner_id`, `ownername`, `td_company_owner_region`
-3. Search deals by company name for closed-won deals (stage `1670665975` or `1670572765`) and get `amount`
-4. Sum closed-won deal amounts as the account's ARR
+Account metadata (name, ARR, region, owner) comes entirely from the TD `hubspot` tables — no HubSpot MCP calls needed for this step.
 
-**Note:** Always search companies by name, not domain — the company `domain` may not match the email domain (e.g., `royalcaribbean.com` vs `rccl.com`). And remember: in this skill, the `domain` field is *only* used for the narrow fallback in Step 4. The primary attribution path goes through `associatedcompanyid`.
+**ARR — use `arr_won_all_rollup` from `hubspot.companies` (already in the CSM matrix from Step 1).** This is the canonical ARR column. Do **not** use `arr_won__all_` (always zero). Do not sum deals unless you need line-item detail beyond what the rollup provides.
+
+**If you need deal-level ARR detail** (e.g. to break down by product or date), query TD directly:
+
+```sql
+SELECT d.dealname, d.amount, d.deal_currency_code, d.closedate,
+       a.company_id
+FROM hubspot.deals d
+JOIN hubspot.deals_to_companies_associations a ON a.deal_id = d.id
+WHERE LOWER(d.dealstage) LIKE '%closed won%'
+  AND a.company_id IN (<hs_object_id list for in-scope companies>)
+  AND GREATEST(COALESCE(d.amount, 0), 0) > 0
+```
+
+Floor negative amounts to 0 (cancelled/credit deals). Sum `amount` per `company_id` for a per-account ARR roll-up. Note: amounts are in `deal_currency_code` — do not sum across currencies without converting first.
+
+**Other metadata fields** (`ownername`, `td_company_owner_region`, `domain`) are already present on `hubspot.companies` rows returned in Step 1 — no additional lookup needed.
+
+**Note:** The `domain` field is *only* used for the narrow domain fallback in Step 4. The primary attribution path goes through `associatedcompanyid`.
 
 ### Step 6: Determine Account Tier from ARR
 

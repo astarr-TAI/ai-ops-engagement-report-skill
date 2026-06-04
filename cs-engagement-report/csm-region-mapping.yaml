@@ -1,46 +1,85 @@
 # How to map CSMs to regions
-# Process for deriving a CSM -> region mapping from HubSpot.
+# Process for deriving a CSM -> region mapping from HubSpot data via TD.
 # Excludes deactivated/active checks.
 
 inputs:
   primary:
-    name: HubSpot company-region
-    type: hubspot_property
+    name: TD hubspot.companies table (account 7060)
+    type: td_sql
     rationale: |
-      Region is recorded on each account via td_company_owner_region; CSM
-      assignment via csm_email + csm__c. Aggregating by csm_email yields the
-      per-CSM region with majority vote. HubSpot is the system of record for
-      both fields, so deriving the matrix from it directly avoids transcription
-      lag and removes the dependency on a separate roster sheet.
-    access_via: hubspot_search_crm_objects
-    object_type: companies
-    filter:
-      - csm_email HAS_PROPERTY
-      - td_company_owner_region HAS_PROPERTY
-    properties_used:
-      - hs_object_id              # company id (join key for downstream queries)
+      The hubspot.companies table in TD is a full sync of HubSpot company records
+      and contains csm_email and td_company_owner_region on every row. Querying
+      it via `tdx query` returns all records in a single call with no row-count
+      limit — no sharding required. arr_won_all_rollup is the correct ARR column
+      (arr_won__all_ is always zero in this table).
+    access_via: tdx query (Bash tool)
+    table: hubspot.companies
+    columns_used:
       - name                      # account display name
       - csm_email                 # CSM email - primary identity key
       - td_company_owner_region   # region tag (Americas / EMEA / Japan / ASIAexJapan / APAC)
-      - arr_won_all_rollup        # ARR rollup (used for tier classification + ranking)
-    sharding: |
-      The HubSpot search endpoint caps each response at 100 records and does not
-      expose a cursor in the current MCP tool. Shard the query by hs_object_id
-      ranges and fan out in parallel; each shard must be sized to stay under
-      the 100-record cap. As of 2026-05-19 the company table has ~456 rows;
-      8 shards covers it cleanly:
-        - id < 150085000000
-        - 150085000000 <= id < 150092000000
-        - 150092000000 <= id < 150100000000
-        - 150100000000 <= id < 150160000000
-        - 150160000000 <= id < 150175000000
-        - 150175000000 <= id < 150180000000
-        - 150180000000 <= id < 300000000000
-        - id >= 300000000000
-      If any shard returns count == 100 in a future run, subdivide that shard.
-      Always sort ASC on hs_object_id within each shard for deterministic output.
+      - arr_won_all_rollup        # ARR rollup (use this — NOT arr_won__all_ which is always 0)
+    query: |
+      WITH csm_accounts AS (
+        SELECT
+          LOWER(SPLIT_PART(csm_email, '@', 1))          AS csm_local,
+          csm_email,
+          td_company_owner_region                        AS region,
+          name                                           AS company,
+          GREATEST(COALESCE(arr_won_all_rollup, 0), 0)  AS arr
+        FROM hubspot.companies
+        WHERE csm_email IS NOT NULL AND csm_email != ''
+          AND td_company_owner_region IN ('Americas','EMEA','Japan','ASIAexJapan','APAC')
+          AND (
+            csm_email LIKE '%.%@treasure-data.com'
+            OR csm_email LIKE '%.%@treasure.ai'
+            OR csm_email IN ('valencia@treasure-data.com','ino@treasure-data.com',
+                             'tsukahara@treasure-data.com','sekikawa@treasure-data.com')
+          )
+      ),
+      region_counts AS (
+        SELECT csm_local, region, COUNT(*) AS cnt
+        FROM csm_accounts
+        GROUP BY csm_local, region
+      ),
+      csm_majority AS (
+        SELECT csm_local, region AS majority_region,
+          ROW_NUMBER() OVER (
+            PARTITION BY csm_local
+            ORDER BY cnt DESC,
+              CASE region
+                WHEN 'Americas'    THEN 1
+                WHEN 'EMEA'        THEN 2
+                WHEN 'Japan'       THEN 3
+                WHEN 'ASIAexJapan' THEN 4
+                WHEN 'APAC'        THEN 5
+              END
+          ) AS rn
+        FROM region_counts
+      )
+      SELECT
+        a.csm_local,
+        a.csm_email,
+        m.majority_region  AS csm_region,
+        a.region           AS account_region,
+        a.company,
+        ROUND(a.arr)       AS arr
+      FROM csm_accounts a
+      JOIN csm_majority m ON m.csm_local = a.csm_local AND m.rn = 1
+      ORDER BY m.majority_region, a.csm_local, a.arr DESC
+    usage: |
+      Run with: tdx query "<sql above>" --limit 500 --json
+      To scope to one region, add AND m.majority_region = 'Americas' before ORDER BY,
+      or filter the result set after the fact in the calling skill.
+      No sharding needed — the full table returns in one call.
 
   excluded:
+    - name: HubSpot MCP tool (hubspot_search_crm_objects)
+      reason: |
+        Caps each response at 100 records with no cursor exposed. Required manual
+        sharding across 8 parallel calls keyed on hs_object_id ranges. Replaced
+        by the TD hubspot.companies table which returns all records in a single
+        query with no size limit.
     - name: Greenspace HeatMap
       reason: |
         Previously the primary source. Now redundant because every Greenspace
@@ -56,80 +95,71 @@ inputs:
       reason: hubspot_search_owners blocked by current MCP auth scope. Used for proper-name resolution if/when unblocked.
 
 steps:
-  - id: 1_pull_hubspot
-    description: Fan out 8 parallel hubspot_search_crm_objects calls on companies, sharded by hs_object_id range.
-    output: list of {hs_object_id, name, csm_email, region, arr} tuples
+  - id: 1_pull_td
+    description: Run the query above via `tdx query` against hubspot.companies in TD account 7060.
+    output: list of {csm_local, csm_email, csm_region, account_region, company, arr} rows
     notes: |
-      Dedupe by hs_object_id when concatenating shard results (boundary records
-      shouldn't appear in two shards if ranges are half-open, but defensive
-      dedup is cheap). Filter region to valid_regions to drop any malformed
-      values. Treat csm_email values like "Hiroki Ito" or "jamie@origin63.com"
-      as data errors and exclude - they aren't internal CSM identities.
+      The WHERE clause already filters out bogus csm_email values (name strings like
+      "Hiroki Ito", external partner addresses like "jamie@origin63.com") by requiring
+      a "." in the local part or membership in the single-token allowlist, AND a
+      treasure.ai / treasure-data.com domain.
+      region is pre-filtered to valid_regions so no further cleanup is needed.
 
   - id: 2_normalize_identity
-    description: Normalize csm_email to its local part (lowercased) so @treasure.ai and @treasure-data.com aliases collapse to one identity.
+    description: csm_local (lowercased local part of csm_email) is the identity key — already computed in the query.
     method: |
       key = email.split("@")[0].lower()
     notes: |
-      Same CSM frequently appears under both domains (e.g. naohiro.nakatani@treasure-data.com
-      and naohiro.nakatani@treasure.ai). Aggregating without dedup splits their
-      book in half.
+      The same CSM frequently appears under both @treasure-data.com and @treasure.ai.
+      The SQL already normalizes this via LOWER(SPLIT_PART(csm_email, '@', 1)).
+      No further dedup needed after the query runs.
 
   - id: 3_aggregate_per_csm
     description: |
-      For each csm_local, count region occurrences across their VALID-region accounts and
-      pick the majority. The resulting csm_region is the SOLE field that determines which
-      regional roundup the CSM appears in. Per-account region tags do not split a CSM's
-      book across roundups - the CSM travels in their majority region with their entire
-      book in tow.
+      Majority region is computed in the query via ROW_NUMBER() with tie-break.
+      After the query, group results by csm_local to build the CSM matrix.
     method: |
-      For csm_local in groups:
-        # 1. Drop accounts whose region is null or not in valid_regions
-        valid_accounts = [a for a in csm_accounts if a.region in VALID_REGIONS]
+      # The query returns one row per account already joined to csm_region.
+      # To build the matrix, group in Python/JS:
+      for csm_local, rows in groupby(results, key='csm_local'):
+        majority_region = rows[0]['csm_region']   # same for all rows (from JOIN)
+        n_accounts      = len(rows)
+        arr_total       = sum(max(r['arr'], 0) for r in rows)
+        region_breakdown = Counter(r['account_region'] for r in rows)
 
-        # 2. Majority vote, with deterministic tie-break
-        regions = Counter(a.region for a in valid_accounts)
-        max_count = max(regions.values())
-        top_candidates = sorted(
-          [r for r, c in regions.items() if c == max_count],
-          key=lambda r: TIE_BREAK_ORDER.index(r),  # see tie_break below
-        )
-        top_region = top_candidates[0]
-        tied_majority = top_candidates if len(top_candidates) > 1 else None
-
-        # 3. cross_region flag (presentation only - does NOT split the book)
+        minority = sum(c for r, c in region_breakdown.items() if r != majority_region)
         cross_region = (
-          len(regions) > 1
-          and (sum_minority := sum(c for r, c in regions.items() if r != top_region)) >= 2
-          and sum_minority / sum(regions.values()) >= 0.20
+          len(region_breakdown) > 1
+          and minority >= 2
+          and minority / n_accounts >= 0.20
         )
     tie_break: |
       Deterministic tie-break order when two or more regions have the same count:
         Americas > EMEA > Japan > ASIAexJapan > APAC
+      This is encoded directly in the SQL CASE expression — no post-processing needed.
       Record the tie in the matrix row as `tied_majority: [Americas, EMEA]` so a
       downstream reviewer can spot edge cases without re-deriving them.
     assignment_policy: |
       HARD RULE - csm_region is the ONLY input to roundup membership.
-      An account whose td_company_owner_region == "Americas" but whose owning
-      CSM resolves to csm_region == "EMEA" appears in the EMEA roundup, not
-      the Americas roundup. There is no per-account region override, no
-      "Americas-tagged accounts split off" rule, no joint inclusion. The
-      account is reported under its CSM's region; the per-account tag is
-      shown in the rendered scorecard cell as informational metadata only.
+      An account whose account_region == "Americas" but whose owning CSM resolves
+      to csm_region == "EMEA" appears in the EMEA roundup, not the Americas roundup.
+      There is no per-account region override, no "Americas-tagged accounts split off"
+      rule, no joint inclusion. The account is reported under its CSM's region; the
+      per-account tag is shown in the rendered scorecard cell as informational metadata only.
 
       Anti-pattern (do NOT do this):
-        scorecard = [a for a in per_account_table if a.region == target]
+        scorecard = [a for a in per_account_table if a.account_region == target]
       Correct pattern:
-        in_scope_csms = {csm for csm, region in csm_region.items() if region == target}
-        scorecard = [a for a in per_account_table if a.csm_email_local in in_scope_csms]
+        in_scope_csms = {csm for csm, info in csm_matrix.items() if info.csm_region == target}
+        scorecard = [a for a in per_account_table if a.csm_local in in_scope_csms]
     notes: |
       The cross_region flag (>=20% minority AND >=2 minority accounts) catches
-      genuine cross-region books like Ana María Villota Serrano (Americas + Brazilian/
-      Mexican Nestlé entities tagged EMEA), Carol Nicholson-Cole (UK + US Mars/Levi),
-      Gaëlle Chedid (mostly EMEA media + 1 Kuwait Food Americana account tagged Americas),
-      and Naohiro Yoshikawa (Japan + Korean accounts in ASIAexJapan). The flag is for
-      surfacing the breakdown in the rendered report, not for assigning accounts to
-      a different region. Don't reassign their region - flag and surface.
+      genuine cross-region books like Ana María Villota Serrano (Americas + Nestlé
+      EMEA-tagged entities), Carol Nicholson-Cole (UK + US Mars/Levi), Gaëlle Chedid
+      (mostly EMEA + 1 Kuwait Food Americana account tagged Americas), and Naohiro
+      Yoshikawa (Japan + Korean accounts in ASIAexJapan). The flag is for surfacing
+      the breakdown in the rendered report, not for assigning accounts to a different
+      region. Don't reassign their region - flag and surface.
 
   - id: 4_assign_confidence
     description: Confidence is a function of book size, since there's no second source to cross-check against.
@@ -140,7 +170,7 @@ steps:
 
   - id: 5_resolve_display_name
     description: |
-      HubSpot's company record has csm_email but no canonical display name.
+      The TD table has csm_email but no canonical display name.
       Apply the override map below first, then fall back to period-delimiter capitalization.
     overrides:
       ana.villotaserrano: "Ana María Villota Serrano"
@@ -159,20 +189,19 @@ steps:
   - id: 6_emit_matrix
     description: |
       Output one row per CSM PLUS a per-account roll-up. The per-account table
-      carries each account's own region tag (informational), but consumers MUST
-      filter by csm_email_local against the in-scope CSM set, never by the
-      per-account region tag (see step 3 assignment_policy).
+      carries each account's own account_region tag (informational), but consumers MUST
+      filter by csm_local against the in-scope CSM set, never by the per-account region tag.
     fields:
       - name              # display name (override or fallback)
-      - email             # canonical @treasure.ai
-      - region            # majority region from HubSpot
+      - email             # canonical csm_email from the table
+      - region            # majority region (csm_region from query)
       - confidence        # high/medium/low based on n_accounts
       - n_accounts        # book size
-      - arr_total         # sum of arr_won_all_rollup across their accounts
-      - region_breakdown  # full Counter, e.g. {Americas: 12, EMEA: 4}
+      - arr_total         # sum of arr across their accounts (floored to 0)
+      - region_breakdown  # Counter, e.g. {Americas: 12, EMEA: 4}
       - cross_region      # bool, true if >=20% minority + >=2 accounts
     accounts_table: |
-      Also emit per-account rows: {hs_object_id, name, csm_email_local, region, arr}.
+      Per-account rows: {company, csm_local, csm_region, account_region, arr}.
       The cs-engagement-report skill consumes this directly as the book-of-business
       filter - no separate query needed for "what accounts does CSM X own?".
 
@@ -180,17 +209,14 @@ steps:
         in_scope_csms = {csm for csm, info in csm_matrix.items()
                          if info.csm_region == target_region}
         scorecard_rows = [r for r in per_account_table
-                          if r.csm_email_local in in_scope_csms]
-      The per-account `region` field is NEVER used as a roundup filter. It is
-      surfaced in the rendered scorecard for transparency (so a reviewer can see
-      "this US-tagged account is in the EMEA roundup because Carol owns it"),
-      but it does not gate inclusion.
+                          if r.csm_local in in_scope_csms]
+      The per-account account_region field is NEVER used as a roundup filter. It is
+      surfaced in the rendered scorecard for transparency only.
 
       Do NOT pre-filter by ARR here - emit every account (including zero-ARR rows).
       The cs-engagement-report skill applies its own configurable min_arr threshold
       at Step 1.6 and surfaces filtered accounts in the dashboard's excludedAccounts
-      footer. Filtering at this level would silently hide accounts from any
-      consumer that isn't using the engagement report's filter.
+      footer.
 
 valid_regions:
   - Americas
@@ -201,8 +227,7 @@ valid_regions:
 
 known_pitfalls:
   - The same CSM appears under both @treasure-data.com and @treasure.ai email
-    domains. Always dedupe on the local part before aggregating, otherwise
-    their book splits and confidence drops artificially.
+    domains. The SQL normalizes this via SPLIT_PART on '@'. No further dedup needed.
   - Cross-region books (Nestlé spread across Americas/EMEA, Mars across UK/US,
     Korean accounts under a Japan-tagged CSM, Gaëlle Chedid's lone Kuwait Food
     Americana account inside an otherwise EMEA book) are real and structural.
@@ -210,20 +235,12 @@ known_pitfalls:
     cross_region: true and let the rendered report show the breakdown.
     AND: never split a cross-region CSM across two roundups. The CSM lives in
     exactly one regional roundup (their majority csm_region) and their full
-    book travels with them. The audit signature of getting this wrong: a
-    CSM's account appears in region X's report but the CSM is missing from
-    that region's CSM list - that means the scoping was account-first instead
-    of CSM-first. See step 3 assignment_policy.
+    book travels with them.
   - csm_email occasionally contains a person's name string ("Hiroki Ito") or an
-    external partner address ("jamie@origin63.com"). These are HubSpot data
-    errors. Filter them out by checking that the local part has a "." separator
-    (or matches a known single-token override like "valencia" / "ino" /
-    "tsukahara" / "sekikawa") and the domain is treasure.ai / treasure-data.com.
-  - Deactivated CSMs cannot be detected from HubSpot company data alone. If a
-    CSM has departed but their account assignments haven't been transferred,
-    they'll appear in the matrix indistinguishable from active CSMs. Surface
-    via a separate signal (HubSpot owner last-login if accessible, or a
-    workspace-maintained deactivated_csms.yaml).
+    external partner address ("jamie@origin63.com"). The WHERE clause filters
+    these out by requiring a "." in the local part or membership in the
+    single-token allowlist, AND a treasure.ai / treasure-data.com domain.
   - arr_won_all_rollup occasionally contains negative or zero values (cancelled
-    deals, unreconciled credits). Floor to 0 when summing for tier
-    classification.
+    deals, unreconciled credits). The SQL floors to 0 via GREATEST(..., 0).
+  - arr_won__all_ (with double underscore) is always zero in this table — it is
+    a different column from arr_won_all_rollup. Always use arr_won_all_rollup.
